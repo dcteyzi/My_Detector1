@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>تشخیص آبجکت — YOLO26</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.webgpu.min.js"></script>
+<style>
+  :root{
+    --bg:#0b0e11;
+    --panel:#14181d;
+    --text:#e8e6e1;
+    --muted:#8b93a1;
+    --accent:#f2a93b;
+    --line:#262c33;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;overflow:hidden;}
+  #stage{position:fixed;inset:0;background:#000;}
+  video,#overlay{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+  #overlay{pointer-events:none;}
+
+  #statusWrap{
+    position:absolute;top:0;left:0;right:0;
+    padding:calc(env(safe-area-inset-top,0px) + 14px) 16px 14px;
+    background:linear-gradient(to bottom, rgba(0,0,0,.55), transparent);
+    font-size:14px;color:var(--text);text-align:center;
+  }
+  #statusWrap.dim{color:var(--muted);}
+
+  #panel{
+    position:absolute;left:0;right:0;bottom:0;
+    padding:14px 16px calc(env(safe-area-inset-bottom,0px) + 16px);
+    background:linear-gradient(to top, rgba(11,14,17,.92), rgba(11,14,17,.65) 70%, transparent);
+    display:flex;flex-direction:column;gap:10px;
+  }
+  .row{display:flex;align-items:center;gap:10px;}
+  .row label{font-size:13px;color:var(--muted);flex-shrink:0;}
+  input[type=range]{flex:1;accent-color:var(--accent);}
+  #thresholdVal,#fps{
+    font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:13px;
+    color:var(--accent);min-width:3.2em;text-align:left;
+  }
+
+  button{
+    appearance:none;border:none;border-radius:12px;padding:14px;
+    font-size:16px;font-weight:600;color:#171308;background:var(--accent);
+    font-family:inherit;
+  }
+  button:active{opacity:.8;}
+  button:disabled{background:var(--line);color:var(--muted);}
+
+  #modelPicker{
+    display:none;flex-direction:column;gap:10px;align-items:stretch;
+    background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;
+  }
+  #modelPicker p{margin:0;font-size:13px;color:var(--muted);line-height:1.6;}
+  input[type=file]{color:var(--muted);font-size:13px;}
+
+  #hint{font-size:12px;color:var(--muted);text-align:center;line-height:1.6;}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="statusWrap"><span id="status" class="dim">در حال بارگذاری کتابخانه...</span></div>
+
+<div id="panel">
+  <div id="modelPicker">
+    <p>فایل model.onnx پیدا نشد. مدل صادر‌شده‌ی خودت رو از اینجا انتخاب کن (روی گوشی از Files، یا رو دسکتاپ):</p>
+    <input type="file" id="modelInput" accept=".onnx">
+  </div>
+
+  <div class="row" id="thresholdRow" style="display:none;">
+    <label>آستانه اطمینان</label>
+    <input type="range" id="threshold" min="0.05" max="0.95" step="0.01" value="0.25">
+    <span id="thresholdVal">0.25</span>
+    <span id="fps">— fps</span>
+  </div>
+
+  <button id="startBtn" style="display:none;">شروع دوربین و تشخیص</button>
+  <div id="hint">دوربین پشت گوشی رو با HTTPS باز کن (نه file://) تا مرورگر اجازه بده.</div>
+</div>
+
+<script>
+// ------------------------------------------------------------------
+// تنظیمات — این دو مورد رو با مدل خودت هماهنگ کن
+// ------------------------------------------------------------------
+
+// ترتیب کلاس‌ها دقیقاً باید با model.names مدل خودت یکی باشه.
+// تو پایتون بعد از ترین: print(list(model.names.values()))
+// و همون لیست رو اینجا بریز — وگرنه به‌جاش شماره‌ی کلاس نشون داده میشه.
+const CLASS_NAMES = [
+  // "cola-330ml", "chips-classic", "milk-1l", ...
+];
+
+// همون imgsz که موقع export دادی (پیش‌فرض یولو 640 هست)
+const MODEL_INPUT_SIZE = 640;
+
+// ------------------------------------------------------------------
+
+const videoEl = document.getElementById('video');
+const canvasEl = document.getElementById('overlay');
+const ctx = canvasEl.getContext('2d');
+const statusEl = document.getElementById('status');
+const statusWrap = document.getElementById('statusWrap');
+const thresholdRow = document.getElementById('thresholdRow');
+const startBtn = document.getElementById('startBtn');
+const modelPicker = document.getElementById('modelPicker');
+const modelInput = document.getElementById('modelInput');
+const thresholdInput = document.getElementById('threshold');
+const thresholdVal = document.getElementById('thresholdVal');
+const fpsEl = document.getElementById('fps');
+
+let session = null;
+let inputName = null;
+let outputName = null;
+let confThreshold = parseFloat(thresholdInput.value);
+let running = false;
+
+const preCanvas = document.createElement('canvas');
+preCanvas.width = MODEL_INPUT_SIZE;
+preCanvas.height = MODEL_INPUT_SIZE;
+const preCtx = preCanvas.getContext('2d', { willReadFrequently: true });
+
+function setStatus(msg, dim) {
+  statusEl.textContent = msg;
+  statusWrap.classList.toggle('dim', !!dim);
+}
+
+// --------------------------- بارگذاری مدل ---------------------------
+
+async function loadModelFromSource(source) {
+  setStatus('در حال بارگذاری مدل...');
+  modelPicker.style.display = 'none';
+  const hasWebGPU = !!navigator.gpu;
+  try {
+    session = await ort.InferenceSession.create(source, {
+      executionProviders: hasWebGPU ? ['webgpu', 'wasm'] : ['wasm'],
+      graphOptimizationLevel: 'all',
+    });
+  } catch (err) {
+    setStatus('بارگذاری مدل شکست خورد: ' + err.message, true);
+    return;
+  }
+  inputName = session.inputNames[0];
+  outputName = session.outputNames[0];
+  setStatus(hasWebGPU ? 'مدل آماده‌ست (WebGPU)' : 'مدل آماده‌ست (WASM — WebGPU در دسترس نبود)', true);
+  startBtn.style.display = 'block';
+  thresholdRow.style.display = 'flex';
+}
+
+async function tryLoadDefaultModel() {
+  try {
+    const res = await fetch('./model.onnx', { method: 'HEAD' });
+    if (res.ok) { await loadModelFromSource('./model.onnx'); return; }
+  } catch (e) { /* ignore, fall through to picker */ }
+  setStatus('model.onnx کنار این صفحه پیدا نشد', true);
+  modelPicker.style.display = 'flex';
+}
+
+modelInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const buf = await file.arrayBuffer();
+  await loadModelFromSource(new Uint8Array(buf));
+});
+
+// --------------------------- دوربین ---------------------------
+
+startBtn.addEventListener('click', async () => {
+  startBtn.disabled = true;
+  startBtn.textContent = 'در حال باز کردن دوربین...';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    videoEl.srcObject = stream;
+    await videoEl.play();
+  } catch (err) {
+    setStatus('دسترسی به دوربین رد شد یا خطا داد: ' + err.message, true);
+    startBtn.disabled = false;
+    startBtn.textContent = 'شروع دوربین و تشخیص';
+    return;
+  }
+  startBtn.style.display = 'none';
+  setStatus('در حال تشخیص...', true);
+  running = true;
+  requestAnimationFrame(inferLoop);
+});
+
+videoEl.addEventListener('loadedmetadata', () => {
+  canvasEl.width = videoEl.videoWidth;
+  canvasEl.height = videoEl.videoHeight;
+});
+window.addEventListener('resize', () => {
+  if (videoEl.videoWidth) {
+    canvasEl.width = videoEl.videoWidth;
+    canvasEl.height = videoEl.videoHeight;
+  }
+});
+
+// --------------------------- پیش‌پردازش (letterbox) ---------------------------
+
+function preprocess() {
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  const scale = Math.min(MODEL_INPUT_SIZE / vw, MODEL_INPUT_SIZE / vh);
+  const nw = Math.round(vw * scale), nh = Math.round(vh * scale);
+  const padX = (MODEL_INPUT_SIZE - nw) / 2, padY = (MODEL_INPUT_SIZE - nh) / 2;
+
+  preCtx.fillStyle = 'rgb(114,114,114)';
+  preCtx.fillRect(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+  preCtx.drawImage(videoEl, 0, 0, vw, vh, padX, padY, nw, nh);
+
+  const imgData = preCtx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE).data;
+  const size = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
+  const chw = new Float32Array(3 * size);
+  for (let i = 0; i < size; i++) {
+    chw[i] = imgData[i * 4] / 255;
+    chw[size + i] = imgData[i * 4 + 1] / 255;
+    chw[2 * size + i] = imgData[i * 4 + 2] / 255;
+  }
+  return { chw, scale, padX, padY };
+}
+
+// --------------------------- استنتاج + رسم ---------------------------
+
+let lastTime = performance.now();
+
+async function inferLoop() {
+  if (!running) return;
+  if (videoEl.readyState < 2) { requestAnimationFrame(inferLoop); return; }
+
+  const { chw, scale, padX, padY } = preprocess();
+  const inputTensor = new ort.Tensor('float32', chw, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]);
+
+  let output;
+  try {
+    const results = await session.run({ [inputName]: inputTensor });
+    output = results[outputName];
+  } catch (err) {
+    setStatus('خطا در اجرای مدل: ' + err.message, true);
+    running = false;
+    return;
+  }
+
+  draw(output, scale, padX, padY);
+
+  const now = performance.now();
+  fpsEl.textContent = (1000 / (now - lastTime)).toFixed(1) + ' fps';
+  lastTime = now;
+
+  requestAnimationFrame(inferLoop);
+}
+
+function classColor(id) {
+  return `hsl(${(id * 47) % 360}, 85%, 55%)`;
+}
+
+function draw(output, scale, padX, padY) {
+  ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+  const data = output.data;
+  const numDet = output.dims[1];
+  const cols = output.dims[2]; // 6 برای detect خالص؛ اگه مدل seg باشه بیشتره ولی ۶ ستون اول همینه
+
+  ctx.lineWidth = Math.max(2, canvasEl.width / 400);
+  ctx.font = `${Math.max(14, canvasEl.width / 60)}px -apple-system, sans-serif`;
+  ctx.textBaseline = 'top';
+
+  for (let i = 0; i < numDet; i++) {
+    const base = i * cols;
+    const conf = data[base + 4];
+    if (conf < confThreshold) continue;
+    const classId = Math.round(data[base + 5]);
+
+    const x1 = (data[base] - padX) / scale;
+    const y1 = (data[base + 1] - padY) / scale;
+    const x2 = (data[base + 2] - padX) / scale;
+    const y2 = (data[base + 3] - padY) / scale;
+
+    const color = classColor(classId);
+    ctx.strokeStyle = color;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+    const label = `${CLASS_NAMES[classId] || 'class ' + classId} ${(conf * 100).toFixed(0)}%`;
+    const th = Math.max(18, canvasEl.width / 45);
+    const tw = ctx.measureText(label).width + 10;
+    const ty = Math.max(0, y1 - th);
+    ctx.fillStyle = color;
+    ctx.fillRect(x1, ty, tw, th);
+    ctx.fillStyle = '#0b0e11';
+    ctx.fillText(label, x1 + 5, ty + th * 0.15);
+  }
+}
+
+thresholdInput.addEventListener('input', (e) => {
+  confThreshold = parseFloat(e.target.value);
+  thresholdVal.textContent = confThreshold.toFixed(2);
+});
+
+// --------------------------- شروع ---------------------------
+
+window.addEventListener('load', () => {
+  if (typeof ort === 'undefined') {
+    setStatus('کتابخانه‌ی onnxruntime-web لود نشد — اتصال اینترنت رو چک کن.', true);
+    return;
+  }
+  tryLoadDefaultModel();
+});
+</script>
+</body>
+</html>
